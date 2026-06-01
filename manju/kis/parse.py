@@ -71,7 +71,6 @@ def parse_frame(raw: str, recv: datetime) -> list:
         n = len(PRICE_COLUMNS)
         return [_trade(fields[i * n:(i + 1) * n], recv) for i in range(count)]
     if tr_id == QUOTE_TR:
-        n = 45  # 선두 45필드 단위(꼬리 더미 포함 count>1은 균등 분할)
         chunk = len(fields) // count
         return [_quote(fields[i * chunk:(i + 1) * chunk], recv) for i in range(count)]
     return []

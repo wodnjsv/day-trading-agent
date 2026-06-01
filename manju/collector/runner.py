@@ -8,12 +8,10 @@ from manju.config import Config
 from manju.kis import auth, rest
 from manju.kis.ws import KISWebSocket
 from manju.kis.parse import parse_frame
-from manju.kis.constants import TRADE_TR, QUOTE_TR
 from manju.collector.subscriber import plan_changes
 from manju.collector.recorder import Recorder
 
 logger = logging.getLogger(__name__)
-_TR = {TRADE_TR, QUOTE_TR}
 
 
 async def _universe_loop(cfg: Config, token: str, ws: KISWebSocket, state: dict):

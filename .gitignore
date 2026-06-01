@@ -4,3 +4,4 @@ __pycache__/
 data/
 secrets.yaml
 *.parquet
+*.egg-info/
