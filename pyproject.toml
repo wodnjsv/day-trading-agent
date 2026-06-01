@@ -1,0 +1,16 @@
+[project]
+name = "manju"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "requests>=2.31",
+    "pyarrow>=15.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
