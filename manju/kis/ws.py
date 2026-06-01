@@ -58,10 +58,10 @@ class KISWebSocket:
             if raw and raw[0] in ("0", "1"):
                 yield raw
             else:
-                # 시스템 메시지: PINGPONG이면 pong
+                # 시스템 메시지: PINGPONG이면 받은 텍스트를 그대로 echo (앱 레벨 keepalive)
                 try:
                     if json.loads(raw)["header"]["tr_id"] == "PINGPONG":
-                        await self._ws.pong(raw)
+                        await self._ws.send(raw)
                 except (json.JSONDecodeError, KeyError):
                     pass
 
