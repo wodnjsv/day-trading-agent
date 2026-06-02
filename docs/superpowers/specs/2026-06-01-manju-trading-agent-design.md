@@ -453,3 +453,71 @@ ReplayFeed(과거틱) ─┘                              (실행 코드 완전 
 → 낙주·상따는 단일 종목이라 데이터 100% 포착 + 사례가 자주 나와 **피드백 루프가 빠름**. 짝꿍은 규칙이 가장 명확하지만 느림. 그래서 셋 다 측정해 비교.
 
 **백테스트의 한계 (정직성):** 스켈핑은 체결 큐 위치·슬리피지·부분체결을 과거 데이터로 완벽 시뮬레이션할 수 없음. 만쥬 본인도 백테스트가 아니라 복기를 함. 따라서 백테스트는 **"명백히 안 되는 것을 빠르게 거르는" 1차 필터**이고, 통과한 전략은 **소액 실거래 포워드 테스트 + 복기**로 최종 검증한다 (검증 경로: 백테스트 → 소액 실거래 → 복기).
+
+---
+
+## 14. 전략 스펙 보완 항목 (2026-06-02 6관점 검토 결과)
+
+§5.1~5.3 3개 전략을 6관점(진입·청산/리스크·데이터실현·코드화·전략간충돌·만쥬충실성)으로 검토 → 각 발견을 스펙 전체와 대조 검증 → **39건 확인, 33개 항목으로 병합.** 이 항목들은 "구현 전/단계별로 확정"할 보완 목록이다 (대부분 초기값·세부 정의 미비 또는 안전·운영 가드 누락).
+
+### 해소 시점 (triage)
+- **Phase 1 빌드 전(정의 확정 — 코드화 차단):** C3 C4 C9 C10 C16, P1 P2 P3 P6, S1 S3, O1 O2 O4
+- **라이브 소액거래 전(안전 가드):** C1 C2 C5 C11 C12 C13 C14, P4 P5, S2, O3
+- **Phase 2 비교 하네스:** C3 C7 C10 C15, P1
+- **Phase 4 다전략 라이브:** C5 C6 C8 C17, O5 O6 O7
+
+### TOP 5 (가장 치명적)
+- **T1 = C1** 손절이 "결정"만 되고 "체결/보호"가 안 됨: IOC 미체결 시 sweep-until-flat/MARKET 에스컬 부재 + WS 단절 시 L2(가격트리거) 자기모순(피드 끊기면 관측 불가) + 장 마감 절대시각 강제청산 부재(오버나잇 위험). 자동화 핵심 명분이 3경로에서 무너짐.
+- **T2 = C2** VI 발동 "상태"가 MarketContext에 없음(발동'가'만). VI 중 IOC 불가·체결강도 왜곡·재개 급변동이 전 전략 게이트를 통과.
+- **T3 = C3** 체결강도 tick rule 비결정적: spread 내부 체결 미분류 + "직전 호가" 시점 정의 부재 + 체결/호가 별도 스트림 머지·동일초 순서 미보존. 전 전략 buy_ratio 의존, 결정#9 주장과 충돌.
+- **T4 = C4** `position_size(plan.regime, account)` 시그니처가 비중 공식("...×전략기본비중")과 모순 — 핵심 변수 미전달, 구현 불가 명세. base_weight 미정의.
+- **T5 = C5** 동일 종목 중복/충돌 진입 차단 계약 부재: Signal에 strategy_name 없음 + evaluate 종목당 단일 position + vet_entry 총량캡만(per-symbol/in-flight 락 없음).
+
+### 공통 (C)
+| ID | 심각도 | 빈틈 | 보완 |
+|---|---|---|---|
+| C1 | High | 손절 체결/피드단절/마감청산 미보장 | IMMEDIATE EXIT=fill-or-escalate(sweep→MARKET) / 피드단절→REST강제청산 or 사전보호주문 / L5 마감강제청산(15:18 차단,15:20 청산), hold_max=min(hold_max, 마감까지) |
+| C2 | High | VI 발동 상태 미노출 | MarketContext.vi_state(NONE/STATIC/DYNAMIC+재개시각), VI중 진입 REJECT+cooldown, 단일가 체결강도 skip, ViLevels 산출식 명문화 |
+| C3 | High | 체결강도 tick rule 비결정 | Lee-Ready 3분류, "직전호가"=체결ts 이하 최근 호가, 두 스트림 시간순 머지+seq번호, raw의 SHNU/SELN_CNTG_CSNU 교차검증 |
+| C4 | High | position_size 시그니처 모순 | `position_size(regime,account,strategy/armed)`, params에 base_weight, stop_pct 역수 risk-parity 옵션 |
+| C5 | High | 중복/충돌 진입 방지 부재 | Signal.strategy_name 추가, vet_entry per-symbol+in-flight 락, 종목 arbiter(IMMEDIATE>기대값>priority), 1종목1포지션 or 키=(symbol,strategy) |
+| C6 | High | 거버너 한도 전략간 배분 없음→짝꿍 기아 | 전략별 sub-cap+전역상한 or reserved quota, vet_entry가 strategy_name으로 전략별 카운터 |
+| C7 | High | 비교 백테스트 자본모델 미정 | §13에 1차=독립자본(격리) 순수엣지 / 2차=공유자본+거버너 통합시뮬 별도보고 |
+| C8 | High | 광기/과열 1시간 캡·오버나잇 금지 미인코딩 | RegimeAnalyzer/ThemeCurator 광기 플래그→hold_max 1시간 강제축소, 오버나잇 0%는 C1 L5와 통합 |
+| C9 | High | 청산측 체결강도 'neutral' 미정의 | neutral 파라미터화, 진입0.65↔청산neutral 히스테리시스, 전략 params 초기값 |
+| C10 | High | ReplayFeed가 MarketContext 스냅샷 미조립 | Phase2에 ContextAssembler(종목별 최신 quote/trade/change/상한가/VI 누적), LiveFeed 공용 |
+| C11 | Med | 거래정지·관리·경고·단기과열 가드 없음 | MarketContext.symbol_status, vet_entry REJECT/감액, ThemeCurator 1차필터 |
+| C12 | Med | 장 운영 시간대 가드 없음(동시호가/시간외) | MarketContext.market_session, vet_entry CONTINUOUS에서만 ENTER+no_new_entry_after |
+| C13 | Med | 손절 후 재진입 쿨다운 없음 | 종목별 쿨다운(N분/당일횟수)+연속손절 당일 블랙리스트(장중 즉시) |
+| C14 | Med | 진입 부분체결 정책 없음 | 실체결수량/평단 기준 청산·백스톱, Position에 의도vs실체결 구분, reconcile 동기화 |
+| C15 | Med | 비교 메트릭 거래세·수수료 net 미반영 | net 정의(세금0.18~0.23%+수수료), gross/net 병기, 평균슬리피지·회전율 메트릭 |
+| C16 | Med | pullback '고점' 기준시점 미정의 | 고점=진입후 체결가 running max로 전략 통일, 부호·분모 명시 |
+| C17 | Low | L4 N연패·종목손실한도 집계주체 미정 | 연패=전략별(부진전략만 휴식), 전역HALT=L3, symbol_loss_cap 전역/전략 택일 |
+
+### 짝꿍 (P)
+| ID | 심각도 | 빈틈 | 보완 |
+|---|---|---|---|
+| P1 | High | 백테스트 페어 식별 주체 부재(§13 LLM-free) | 결정론적 PairBuilder(대장=near_pct, 후속=gap_min+근접) or "LLM 페어 없으면 백테스트 제외, 포워드만" 명문화 |
+| P2 | High | break_ratio 분모 '관측 peak' 시작점 미정의 | peak=lock 이후 상한가 매수잔량 running max, lock시 리셋 |
+| P3 | High | '상한가 안착(매수잔량 형성)' 정량기준 미정의 | locked=현재가==상한가 AND 잔량≥lock_qty_min AND ≥lock_dwell_s, params 추가 |
+| P4 | High | L1 손절이 대장주 피드 생존 의존, 보장경로 없음 | 무장 페어 leader를 rotation서 제외(pinned), 피드끊김→follower 즉시청산 격상 |
+| P5 | Med | L의 VI/거래정지/freshness, F stale 가드 없음 | L VI/단일가면 ENTER보류·L2의존, L·F freshness 체크, required_symbols→Subscriber 배선 |
+| P6 | Low | gap_close 초기값 부재 | 초기값(예 4%p)+gap 정의=|change_pct[L]−change_pct[F]| |
+
+### 상따 (S)
+| ID | 심각도 | 빈틈 | 보완 |
+|---|---|---|---|
+| S1 | High | '상한가 도달 실패' 확정 시점(시간게이트) 부재 | 진입후 fail_s 내 lock 미성립→모멘텀소멸 평가 활성화, fail_s params (모멘텀소멸 정의 L238은 유지) |
+| S2 | Med | 진입시점 VI 상태 가드 부재(VI 직격 1순위) | 'vi_state==NONE+단일가 아닐때만 IOC', 상승VI중 보류+cooldown, 윈도우상단 동적조정 |
+| S3 | Med | 진입게이트 결합논리·밴드 의도 미명시 | 명시 AND식: change_pct∈[22,29.5] AND 상한가거리∈[min_room,near_pct] AND 미lock AND 체결강도 |
+
+### 낙주 (O)
+| ID | 심각도 | 빈틈 | 보완 |
+|---|---|---|---|
+| O1 | High | 낙폭 임계 -15%가 원문(-50% 반토막)과 정면배치 | '원문=반토막 근접, -15%는 표본용 추정' 단서+1차기준 -35~-50% 상향검토 |
+| O2 | High | '직전 저점' 정의 미정(손절·반등확인 의존) | 반등확인용=최근 lookback_s 롤링min / 손절용=진입시 고정 swing low, lookback_s params |
+| O3 | Med | VI/단일가 노출 최대+'끝없이 빠지는 종목' 미구체화 | 하락VI 단일가면 반등판정 보류+재개 cooldown, high_price 미가용시 신호무효, 거래정지 차단(C11) |
+| O4 | Med | 당일고가/직전저점 추적 정확도(top20 진입전 미녹음) | Trade에 high/low typed컬럼(raw idx8/9), 라이브·백테 모두 자체 running max 단일소스+REST 시드 |
+| O5 | Med | LIMIT_GRID 받치기 누락+§5.3/§6 손절표현 불일치 | §5.3 진입에 LIMIT_GRID(지지선 분할) 옵션, 손절을 §6 L1(지지선 이탈)과 일치, IOC vs Grid 백테 비교 |
+| O6 | Med | VI 가격 타겟팅 의사결정룰 미흡수(원문 강조) | 상따·짝꿍 진입에 'VI근접+가속' 결합, 익절에 'VI직전 매도벽→VI전 익절', MVP제외시 §10 등재 |
+| O7 | Low | 무수익 횡보시 손익무관 조기청산 부재 | 무수익 타임아웃(T초내 +rebound_min 재확인 실패→본전청산) or '반등둔화' 손익무관 일반화 |
