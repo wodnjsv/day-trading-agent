@@ -256,7 +256,41 @@ def evaluate(self, ctx, armed, position):
 
 핵심 차이: 짝꿍·상따는 "강한 상승에 올라타기", 낙주는 "급락 후 반등 받기" → **타이트 손절 + 빠른 회전**이 생명.
 
-> **데이터 메모:** 낙주의 "당일 고점"은 KIS 체결 프레임의 `STCK_HGPR`. 현재 `Trade` 스키마엔 typed 컬럼이 없지만 **`raw`(전체 프레임)에 보존**되므로 데이터 손실 없음 — 낙주 빌드 시 `raw`에서 `high_price` 컬럼으로 surface하면 됨.
+> **데이터 메모:** 낙주의 "당일 고점"은 KIS 체결 프레임의 `STCK_HGPR`. 현재 `Trade` 스키마엔 typed 컬럼이 없지만 **`raw`(전체 프레임)에 보존**되므로 데이터 손실 없음 — 낙주 빌드 시 `raw`에서 `high_price` 컬럼으로 surface하면 됨. (소스 확정은 §5.4 O4)
+
+### 5.4 정의 확정 (2026-06-02 §14 검토 반영 — Phase 1 코드화 차단 해소)
+
+§14 검토에서 나온 "정의 미비로 코드화 불가" 항목들을 여기서 확정한다. 이 절이 §5.1~5.3의 모호 표현에 대해 **권위 있는 정의**다. (해소 항목: C3 C4 C9 C16, P1 P2 P3 P6, S1 S3, O1 O2 O4 / C10은 §7)
+
+**[공통] 체결강도 (C3 해소 — tick rule 폐기):** "직전 호가" 재구성 대신 KIS 체결프레임 `CCLD_DVSN`(체결구분: `1`=매수주도, `5`=매도주도, `3`=장전)을 직접 사용. 최근 `W`초(5s) 윈도우에서 `buy_ratio = Σ(CCLD_DVSN=1 체결량) / Σ(전체 체결량)`. spread 내부 체결·직전호가 시점·스트림 머지 모호성이 전부 사라져 결정론적. (결정 #9와 무모순 — 윈도우·비율은 우리가 직접 계산, KIS의 누적 CTTR은 여전히 미사용.) 단일가(VI) 구간 틱은 계산에서 제외(C2 후속, 안전 tier).
+
+**[공통] 청산측 체결강도 약화 'neutral' (C9):** `buy_ratio < neutral`(초기 **0.50**). 진입(0.65/0.60) ↔ 청산(0.50) 히스테리시스로 채터링 방지. 각 전략 params에 등재.
+
+**[공통] pullback 기준 '고점' (C16):** "포지션 진입 이후 관측 체결가 running max". 되돌림 = `(현재가 − run_max)/run_max ≤ pullback`(음수). 진입 시 `run_max = 진입가`로 초기화. 전 전략 동일.
+
+**[짝꿍/상따] 상한가 '안착(locked)' 정량 (P3):** `locked = (현재가 == 상한가) AND (상한가 매수잔량 ≥ lock_qty_min, 초기 50,000주) AND (위 상태 ≥ lock_dwell_s 유지, 초기 3s)`. 익절 홀딩(§5.1 익절·§5.2 익절)의 "안착" 판정 기준.
+
+**[짝꿍/상따] break_ratio 분모 'peak' (P2):** peak = "locked 성립 이후 상한가 매수잔량의 running max"(locked 성립 시 트래커 리셋). 붕괴 = `현재 상한가 잔량 ≤ break_ratio × peak`(0.50) **OR** 상한가 아래 체결.
+
+**[짝꿍] gap_close 초기값 (P6):** `4%p`(gap_min 8%의 절반). gap = `change_pct[L] − change_pct[F]`(단위 %p, 진입②의 gap_min과 동일).
+
+**[비중] position_size 시그니처 (C4):** `position_size(regime, account, armed)`로 수정(전략 인자 추가). `ArmedStrategy.params.base_weight`(전략별 기본비중) 신설. 비중 = `자본 × 시황배수 × base_weight`, cap by 종목당상한·EXPOSURE_CAP. 전략별 stop_pct 상이(−2.5/−2.0/−1.5%) → 향후 risk-parity(`base_weight ∝ 1/stop_pct`) 옵션. (§6 비중식이 이 정의를 따름)
+
+**[상따] '상한가 도달 실패' 시간게이트 (S1):** 진입 후 `fail_s`(초기 30s) 내 locked 미성립 시 "모멘텀 소멸"(§5.2 손절: 체결강도<neutral OR pullback) 평가를 활성화. 진입 직후부터 즉시 손절 평가하지 않음(찰나의 흔들림 허용). fail_s를 params에 등재.
+
+**[상따] 진입 결합 논리식 (S3):** `등락률 ∈ [22%, 29.5%] AND (상한가−현재가)/상한가 ∈ [min_room 0.3%, near_pct 4%] AND NOT locked AND buy_ratio ≥ 0.65`. (상한가 거리는 [하한 0.3%, 상한 4%] 단일 밴드.)
+
+**[낙주] 낙폭 기준 drop_pct (O1 — 원문 충실 + 스윕):** 1차 기준 **−35%**(만쥬 '반토막' 정신), 백테스트로 **−25%~−50%** 스윕해 최적화. (−15%는 폐기 — 일상 조정 오인 위험.) 데이터로 최적 낙폭 결정.
+
+**[낙주] '직전 저점' 정의 (O2 — 용도 분리):** 반등확인용 = 최근 `lookback_s`(초기 30s) 롤링 min(갱신). 손절용 = **진입 시 고정한 swing low**(불변, 이탈 시 즉시 손절). 둘은 별개 값.
+
+**[낙주] 당일고가/저점 소스 (O4):** 라이브·백테스트 모두 **"수집 시작 이후 자체 관측 체결가 running max/min"을 단일 소스**로 사용(STCK_HGPR/STCK_LWPR은 교차검증·보조). 장 초반 공백은 REST 일중 고가 1회로 시드. `Trade`에 `high_price`/`low_price` typed 컬럼 추가(raw idx 8/9) — Phase 1 작업. 단, 종목이 급락 도중 top20 진입 시 진입 전 고점 미관측 가능 → §13 낙주 평가에 정확도 저하 단서.
+
+**[백테스트] 짝꿍 페어 식별 PairBuilder (P1 — 결정론적):** Phase 2 비교 백테스트는 LLM이 없으므로 결정론적 `PairBuilder`로 페어 자동 생성:
+- 대장 후보 = 같은 시간대 `near_pct`(상한가 근접) 충족 + 거래대금 최상위 종목
+- 후속 = 같은 시간대 동반 상승 중이나 `gap_min` 이상 덜 오른 동시수집 종목 (가격대·가능하면 섹터 근접)
+- 한 대장에 후속 N개 페어링 허용, 각 페어를 짝꿍 armed로 백테스트
+근사 페어링이라 노이즈 존재 → 백테스트 짝꿍 결과는 "하한 추정"으로 해석, 라이브는 LLM 페어로 정밀화.
 
 ---
 
@@ -281,13 +315,13 @@ def vet_entry(self, signal, plan, account, market) -> Decision:
     if plan.regime == "HALT":                return REJECT("시황 서킷브레이커")
     if self.open_positions >= MAX_CONCURRENT:return REJECT("동시보유 한도")
     if symbol_loss_cap_hit(signal.symbol):   return REJECT("종목당 손실한도")
-    size = position_size(plan.regime, account)   # 자본×시황배수×전략기본비중
+    size = position_size(plan.regime, account, armed)   # 자본×시황배수×base_weight (정의 §5.4 C4)
     if not orderbook_thick_enough(market, signal.symbol, size):
         return REJECT("호가창 얇음 — 슬리피지 위험")    # 만쥬 '소거' 원칙
     if total_exposure + size > EXPOSURE_CAP: return REJECT("총 익스포저 한도")
     return APPROVE(size)
 ```
-**비중** = `자본 × 시황배수(BULL 1.0 … BEAR 0.2) × 전략기본비중`, cap by 종목당상한·총익스포저상한 → 만쥬님 "5억→1억" 축소가 `시황배수` 한 변수로 구현됨.
+**비중** = `자본 × 시황배수(BULL 1.0 … BEAR 0.2) × base_weight(전략별)`, cap by 종목당상한·총익스포저상한 (시그니처·정의 §5.4 C4) → 만쥬님 "5억→1억" 축소가 `시황배수` 한 변수로 구현됨.
 **호가두께 체크가 거버너에 있는 이유**: watchlist 선정(두뇌)은 사전 후보일 뿐, 진입 직전 실시간 호가가 주문 규모를 슬리피지 없이 감당하는지는 그 순간 확인해야 함.
 
 ---
@@ -307,7 +341,9 @@ LiveFeed(KIS WS)  ─┐
                    ├─→ 동일 MarketContext 스트림 → SignalEngine + RiskGovernor
 ReplayFeed(과거틱) ─┘                              (실행 코드 완전 동일)
 ```
-백테스트 = `ReplayFeed` + 동일 전략·거버너 + **체결 시뮬레이터**(호가 기반 슬리피지·부분체결 모델). 실행 코드 재사용 → 백테스트/실거래 괴리 없음.
+백테스트 = `ReplayFeed` + **ContextAssembler** + 동일 전략·거버너 + **체결 시뮬레이터**(호가 기반 슬리피지·부분체결 모델). 실행 코드 재사용 → 백테스트/실거래 괴리 없음.
+
+> **ContextAssembler (C10 해소):** ReplayFeed/LiveFeed 둘 다 단일 이벤트(Trade/OrderBook)만 흘리므로, 이를 받아 **종목별 최신 스냅샷(quotes·last_trades·change_pct·upper_limit·vi_prices)을 누적해 매 시점 `MarketContext`를 조립**하는 컴포넌트가 필요(§3 컴포넌트에 추가). 라이브·백테스트 공용 → 괴리 제거. **ViLevels(상·하 VI 발동가)** 산출: KRX 정적 VI(기준가 대비 규정%)·동적 VI(직전 체결 대비 규정%) 중 가까운 값으로 계산 — 정확한 % 테이블은 KRX 규정 반영해 빌드 시 확정.
 - 실행 레이어(룰): Plan 고정 입력 + 과거 틱으로 결정론적 재현 → 정밀 백테스트.
 - 두뇌 레이어(LLM): 프롬프트 회귀 테스트(과거 케이스에 올바른 분류·등급?) — 통계 백테스트가 아니라 의사결정 품질 평가.
 
@@ -459,6 +495,8 @@ ReplayFeed(과거틱) ─┘                              (실행 코드 완전 
 ## 14. 전략 스펙 보완 항목 (2026-06-02 6관점 검토 결과)
 
 §5.1~5.3 3개 전략을 6관점(진입·청산/리스크·데이터실현·코드화·전략간충돌·만쥬충실성)으로 검토 → 각 발견을 스펙 전체와 대조 검증 → **39건 확인, 33개 항목으로 병합.** 이 항목들은 "구현 전/단계별로 확정"할 보완 목록이다 (대부분 초기값·세부 정의 미비 또는 안전·운영 가드 누락).
+
+> **✅ 해소 진행 (2026-06-02):** Phase 1 코드화 차단 tier — **C3 C4 C9 C16, P1 P2 P3 P6, S1 S3, O1 O2 O4 → §5.4에서 확정.** C10(ContextAssembler)은 §7. 나머지(안전 가드 C1·C2·C5·C11~C14, Phase 2/4 C6·C7·C8·C15·C17·O5~O7 등)는 해당 단계에서 해소 예정.
 
 ### 해소 시점 (triage)
 - **Phase 1 빌드 전(정의 확정 — 코드화 차단):** C3 C4 C9 C10 C16, P1 P2 P3 P6, S1 S3, O1 O2 O4
