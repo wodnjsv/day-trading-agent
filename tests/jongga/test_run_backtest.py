@@ -68,3 +68,19 @@ def test_no_lookahead_future_close_does_not_change_day_d():
     n = min(len(base_out["net_returns"]), len(fut_out["net_returns"]))
     # 01-06이 매도일(d+1)인 거래일 d=01-05만 영향. 그 이전 거래일들은 동일.
     assert base_out["net_returns"][:n - 1] == fut_out["net_returns"][:n - 1]
+
+
+def test_supply_factor_enters_when_panels_present():
+    cfg = Config(
+        factors=type(Config().factors)(ma_windows=(2, 3), high_window=3, vol_window=2),
+        universe=type(Config().universe)(top_k_value=10, min_marketcap=1),
+        basket_k=3,
+    )
+    dates, p = _synthetic(cfg)
+    tickers = list(p["close"].columns)
+    # 종목마다 다른 순매수 → supply factor가 종목별로 달라져 IC 계산 가능
+    inst = _panel(np.tile(np.arange(len(tickers)) * 1e8, (len(dates), 1)), dates, tickers)
+    p["inst_net"] = inst
+    p["foreign_net"] = inst * 0.5
+    out = collect_gate_inputs(dates, p, cfg, WEIGHTS, COSTS)
+    assert len(out["factor_ics"]["supply"]) >= 1   # 수급 패널 있으면 supply IC 수집됨

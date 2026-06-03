@@ -19,6 +19,7 @@ import pandas as pd
 from jongga.universe import build_universe, EXCLUDE_SECT
 from jongga.factors.chart import spread, alignment, proximity, days_since_high, vol_ratio
 from jongga.factors.value import value_rank
+from jongga.factors.flow import supply_factor
 from jongga.selector import score_and_select
 from jongga.gate.ic import daily_ic, ic_series_stats, bh_significant
 
@@ -46,7 +47,9 @@ def collect_gate_inputs(dates, panels, cfg, weights, costs):
     """
     close, open_ = panels["close"], panels["open"]
     value, mcap, sect, vol = panels["value"], panels["mcap"], panels["sect"], panels["vol"]
-    supply = panels.get("supply")  # optional: {date×ticker} (외국인+기관)/거래대금 비율 등
+    inst_net = panels.get("inst_net")          # optional 수급 패널 [date×ticker] (원)
+    foreign_net = panels.get("foreign_net")
+    has_supply = inst_net is not None and foreign_net is not None
     longest = cfg.factors.ma_windows[-1]
 
     factor_ics: dict[str, list[float]] = {f: [] for f in FACTOR_COLS}
@@ -76,8 +79,15 @@ def collect_gate_inputs(dates, panels, cfg, weights, costs):
 
         feats = pd.DataFrame(rows).T.astype(float)
         feats["value_rank"] = value_rank(value.loc[tm1, feats.index])
-        if supply is not None and tm1 in supply.index:
-            feats["supply"] = supply.loc[tm1, feats.index]
+        if has_supply:                          # 최근 5일 (외국인+기관)순매수/거래대금 누적
+            sup = {}
+            for t in feats.index:
+                w = pd.DataFrame({"inst_net": inst_net.loc[hist, t],
+                                  "foreign_net": foreign_net.loc[hist, t],
+                                  "value": value.loc[hist, t]}).dropna()
+                if len(w):
+                    sup[t] = supply_factor(w, lookback=5)
+            feats["supply"] = pd.Series(sup)
 
         # overnight 수익 (매수 close[d], 매도 open[d+1]) — 미래는 d+1 시초까지만
         c_d = close.loc[d, feats.index]
@@ -106,10 +116,11 @@ def collect_gate_inputs(dates, panels, cfg, weights, costs):
     return {"factor_ics": factor_ics, "net_returns": net_returns, "baskets_t1": baskets}
 
 
-def load_panels(provider, dates: list[str]):
-    """달력 후보일들에 대해 KRX daily를 받아(캐시) [date×ticker] 패널로 적재.
+def load_panels(provider, dates, supply_provider=None):
+    """달력 후보일들에 대해 KRX daily(+선택적 수급)를 받아(캐시) [date×ticker] 패널로 적재.
     거래일이 아닌 날(빈 응답)은 건너뛴다. 반환: (실제 거래일 정렬 리스트, panels)."""
     acc = {k: {} for k in ["close", "open", "value", "mcap", "sect", "vol"]}
+    sup = {"inst_net": {}, "foreign_net": {}}
     mktval = {}
     for dt in dates:
         df = provider.daily(dt)
@@ -122,6 +133,10 @@ def load_panels(provider, dates: list[str]):
         acc["sect"][dt] = df["sect"]
         acc["vol"][dt] = df["volume"]
         mktval[dt] = float(df["value"].sum())
+        if supply_provider is not None:
+            s = supply_provider.supply(dt)
+            sup["inst_net"][dt] = s["inst_net"]
+            sup["foreign_net"][dt] = s["foreign_net"]
     panels = {
         "close": pd.DataFrame(acc["close"]).T.sort_index(),
         "open": pd.DataFrame(acc["open"]).T.sort_index(),
@@ -131,6 +146,9 @@ def load_panels(provider, dates: list[str]):
         "vol": pd.DataFrame(acc["vol"]).T.sort_index(),
         "mktval": pd.Series(mktval).sort_index(),
     }
+    if supply_provider is not None:
+        panels["inst_net"] = pd.DataFrame(sup["inst_net"]).T.sort_index()
+        panels["foreign_net"] = pd.DataFrame(sup["foreign_net"]).T.sort_index()
     return sorted(mktval), panels
 
 
@@ -147,10 +165,12 @@ def main(start: str | None = None, end: str | None = None, slippage: float = 0.0
     start = start or cfg.start_date
     krx_key = yaml.safe_load(Path("secrets.yaml").read_text(encoding="utf-8"))["krx_api_key"]
     provider = KrxProvider(cfg.data_dir, krx_key)
+    from jongga.data.pykrx_supply import PykrxSupply
+    supply_provider = PykrxSupply(cfg.data_dir, market=cfg.market)
 
     cal = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, end)]
-    logger.info("loading KRX daily for %d candidate business days...", len(cal))
-    dates, panels = load_panels(provider, cal)
+    logger.info("loading KRX daily(+supply) for %d candidate business days...", len(cal))
+    dates, panels = load_panels(provider, cal, supply_provider)
     logger.info("trading days loaded: %d (%s ~ %s)", len(dates),
                 dates[0] if dates else "-", dates[-1] if dates else "-")
 
