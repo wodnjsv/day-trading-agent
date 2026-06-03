@@ -23,9 +23,11 @@ jongga/                         # 신규 패키지 (이름 변경 가능)
   calendar.py                   # 거래일(영업일) 유틸 — pykrx 기반
   data/
     __init__.py
-    schema.py                   # 정규 스키마: DailyBar, SupplyRow(외국인/기관 카테고리 정규화)
-    provider.py                 # MarketDataProvider 추상 인터페이스
-    pykrx_provider.py           # pykrx 구현 + parquet 캐시
+    schema.py                   # 수급 정규 스키마(외국인/기관 카테고리 정규화)
+    cache.py                    # parquet 캐시 유틸
+    provider.py                 # MarketDataProvider 추상 인터페이스(daily/supply)
+    krx_provider.py             # KRX OpenAPI 구현(가격·시총·소속부·PIT) [1차]
+    pykrx_supply.py             # pykrx 수급(투자자별 순매수)
   factors/
     __init__.py
     chart.py                    # MA/Spread/Alignment/Proximity/DaysSinceHigh/VolRatio/NearMA (t-1, 순수)
@@ -52,7 +54,7 @@ docs/superpowers/prereg/
   2026-06-04-phase1-gate-prereg.md   # Phase 0 사전등록 문서
 ```
 
-**책임 분리:** `schema`/`factors`/`universe`/`regime`/`selector`/`sizing`/`fill_model`/`metrics`/`ic`/`drift`는 네트워크 없는 순수 로직 → TDD. `pykrx_provider`의 실호출은 통합 검증(실제 출력 대조 후 필드 매핑 확정). `engine`/`run_backtest`는 통합.
+**책임 분리:** `schema`/`factors`/`universe`/`regime`/`selector`/`sizing`/`fill_model`/`metrics`/`ic`/`drift`는 네트워크 없는 순수 로직 → TDD. `krx_provider`/`pykrx_supply`의 실호출은 통합 스모크(인증·필드는 `scripts/krx_probe.py`로 확정, pykrx 수급 컬럼만 잔여 확인). `engine`/`run_backtest`는 통합.
 
 **누수 차단 불변식(전 태스크 공통):** 의사결정일 `d`의 선정·수급·universe·regime 입력은 **`d` 이전(t-1 이하)** 데이터만. 매수 체결가 = `d` 종가, 매도 = `d+1` 시초. 이 불변식은 Task 12 엔진에서 단위테스트로 강제한다.
 
@@ -287,54 +289,47 @@ git add jongga/data/schema.py tests/jongga/test_schema.py && git commit -m "feat
 
 ---
 
-## Task 3: 데이터 프로바이더 — `data/provider.py` + `data/pykrx_provider.py`
+## Task 3: 데이터 프로바이더 — KRX OpenAPI(가격·시총·PIT) + pykrx(수급)
 
-EOD 데이터를 정규 형태로 공급 + parquet 캐시. 캐시 로직은 TDD, pykrx 실호출은 통합 검증.
+KRX OpenAPI 공식 키로 **코스닥 일별매매정보**(OHLCV·거래대금·시총·상장주식수·소속부)를, pykrx로 **수급**(투자자별 순매수)을 공급 + parquet 캐시. **인증·필드는 `scripts/krx_probe.py`로 이미 확정**(GET + `AUTH_KEY` 헤더 + `basDd` 쿼리, 값은 콤마 없는 문자열). 순수 파싱·캐시는 TDD, 실호출은 통합 스모크. 수급(pykrx) 컬럼명만 잔여 통합검증.
 
 **Files:**
-- Create: `jongga/data/provider.py`
-- Create: `jongga/data/pykrx_provider.py`
-- Test: `tests/jongga/test_provider.py`
+- Create: `jongga/data/cache.py`, `jongga/data/provider.py`
+- Create: `jongga/data/krx_provider.py`, `jongga/data/pykrx_supply.py`
+- Test: `tests/jongga/test_cache.py`, `tests/jongga/test_krx_provider.py`
 
-- [ ] **Step 1: 인터페이스 작성 (테스트 불필요한 추상)**
+- [ ] **Step 1: 인터페이스 (provider.py)**
 
 ```python
 # jongga/data/provider.py
-"""MarketDataProvider 추상 인터페이스. 백테스트=pykrx / (라이브=KIS, 별도 계획)."""
+"""MarketDataProvider 추상 인터페이스. 백테스트 1차=KRX OpenAPI / 수급=pykrx."""
 from __future__ import annotations
 from typing import Protocol
 import pandas as pd
 
 
 class MarketDataProvider(Protocol):
-    def ohlcv(self, start: str, end: str) -> pd.DataFrame:
-        """일봉. MultiIndex (date, ticker), 컬럼: open/high/low/close/volume/value."""
+    def daily(self, date: str) -> pd.DataFrame:
+        """그 날짜 전종목 일별매매. index=ticker(ISU_CD), 컬럼:
+        open/high/low/close/volume/value/marketcap/shares/sect.
+        index 자체가 그 시점 PIT 멤버십(상폐 포함 → 생존편향 차단)."""
         ...
 
-    def market_cap(self, date: str) -> pd.DataFrame:
-        """해당 date 시총. index=ticker, 컬럼: marketcap/shares."""
-        ...
-
-    def supply(self, start: str, end: str) -> pd.DataFrame:
-        """투자자별 순매수. MultiIndex (date, ticker), 컬럼: inst_net/foreign_net."""
-        ...
-
-    def tickers(self, date: str) -> list[str]:
-        """해당 date에 상장돼 있던 종목(PIT — 상폐 종목 포함, 생존편향 차단)."""
+    def supply(self, date: str) -> pd.DataFrame:
+        """투자자별 순매수. index=ticker, 컬럼: inst_net/foreign_net."""
         ...
 ```
 
-- [ ] **Step 2: 캐시 로직 실패하는 테스트 작성**
+- [ ] **Step 2: 캐시 유틸 TDD (cache.py)**
 
 ```python
-# tests/jongga/test_provider.py
+# tests/jongga/test_cache.py
 import pandas as pd
-from jongga.data.pykrx_provider import cache_path, load_or_fetch
+from jongga.data.cache import cache_path, load_or_fetch
 
 
 def test_cache_path_layout(tmp_path):
-    p = cache_path(tmp_path, "ohlcv", "2026-06-01")
-    assert p == tmp_path / "ohlcv" / "2026-06-01.parquet"
+    assert cache_path(tmp_path, "daily", "2026-06-01") == tmp_path / "daily" / "2026-06-01.parquet"
 
 
 def test_load_or_fetch_uses_cache_when_present(tmp_path):
@@ -345,34 +340,25 @@ def test_load_or_fetch_uses_cache_when_present(tmp_path):
         calls["n"] += 1
         return df
 
-    p = cache_path(tmp_path, "ohlcv", "2026-06-01")
-    out1 = load_or_fetch(p, fetch)      # 첫 호출: fetch + 캐시 기록
-    out2 = load_or_fetch(p, fetch)      # 두 번째: 캐시에서
+    p = cache_path(tmp_path, "daily", "2026-06-01")
+    load_or_fetch(p, fetch)
+    out = load_or_fetch(p, fetch)
     assert calls["n"] == 1
-    assert list(out2["close"]) == [100, 200]
+    assert list(out["close"]) == [100, 200]
 ```
 
-- [ ] **Step 3: 테스트 실패 확인**
-
-Run: `.venv/bin/pytest tests/jongga/test_provider.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'jongga.data.pykrx_provider'`
-
-- [ ] **Step 4: 최소 구현 (캐시 + pykrx 호출 골격)**
+Run: `.venv/bin/pytest tests/jongga/test_cache.py -v` → FAIL (`No module named 'jongga.data.cache'`). 그 뒤 구현:
 
 ```python
-# jongga/data/pykrx_provider.py
-"""pykrx 기반 MarketDataProvider + parquet 캐시.
-
-pykrx 함수 시그니처/컬럼명은 Step 6 통합검증에서 실제 출력으로 확정한다.
-캐시 단위: 종류별·날짜별 1파일.
-"""
+# jongga/data/cache.py
+"""parquet 캐시 유틸(종류별·날짜별 1파일)."""
 from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 import pandas as pd
 
 
-def cache_path(data_dir: Path, kind: str, key: str) -> Path:
+def cache_path(data_dir, kind: str, key: str) -> Path:
     return Path(data_dir) / kind / f"{key}.parquet"
 
 
@@ -383,65 +369,138 @@ def load_or_fetch(path: Path, fetch: Callable[[], pd.DataFrame]) -> pd.DataFrame
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path)
     return df
+```
+
+Run again → PASS (2 passed).
+
+- [ ] **Step 3: KRX 응답 파싱 순수함수 — 실패 테스트 (parse_daily)**
+
+```python
+# tests/jongga/test_krx_provider.py
+from jongga.data.krx_provider import parse_daily
 
 
-class PykrxProvider:
-    def __init__(self, data_dir: Path, market: str = "KOSDAQ"):
+def test_parse_daily_normalizes_strings():
+    rows = [{"ISU_CD": "060310", "TDD_OPNPRC": "3210", "TDD_HGPRC": "3300",
+             "TDD_LWPRC": "3200", "TDD_CLSPRC": "3300", "ACC_TRDVOL": "100",
+             "ACC_TRDVAL": "5774925915", "MKTCAP": "160170918600",
+             "LIST_SHRS": "48536642", "SECT_TP_NM": "중견기업부"}]
+    df = parse_daily(rows)
+    assert df.loc["060310", "close"] == 3300
+    assert df.loc["060310", "open"] == 3210
+    assert df.loc["060310", "marketcap"] == 160170918600
+    assert df.loc["060310", "sect"] == "중견기업부"
+```
+
+Run: `.venv/bin/pytest tests/jongga/test_krx_provider.py -v` → FAIL (`No module named 'jongga.data.krx_provider'`).
+
+- [ ] **Step 4: KRX 프로바이더 구현 (krx_provider.py)**
+
+```python
+# jongga/data/krx_provider.py
+"""KRX OpenAPI(코스닥 일별매매정보) 프로바이더. 인증=AUTH_KEY 헤더(프로브 확정)."""
+from __future__ import annotations
+import json
+import urllib.parse
+import urllib.request
+from pathlib import Path
+import pandas as pd
+from jongga.data.cache import cache_path, load_or_fetch
+
+BASE = "https://data-dbg.krx.co.kr/svc/apis/sto/ksq_bydd_trd"
+_FIELDS = {"ISU_CD": "ticker", "TDD_OPNPRC": "open", "TDD_HGPRC": "high",
+           "TDD_LWPRC": "low", "TDD_CLSPRC": "close", "ACC_TRDVOL": "volume",
+           "ACC_TRDVAL": "value", "MKTCAP": "marketcap", "LIST_SHRS": "shares",
+           "SECT_TP_NM": "sect"}
+_NUM = ["open", "high", "low", "close", "volume", "value", "marketcap", "shares"]
+
+
+def parse_daily(rows: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)[list(_FIELDS)].rename(columns=_FIELDS)
+    for c in _NUM:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
+    return df.set_index("ticker")
+
+
+def _fetch(date: str, api_key: str) -> list[dict]:
+    url = BASE + "?" + urllib.parse.urlencode({"basDd": date})
+    req = urllib.request.Request(url, headers={"AUTH_KEY": api_key})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8")).get("OutBlock_1", [])
+
+
+class KrxProvider:
+    def __init__(self, data_dir, api_key: str):
+        self.data_dir = Path(data_dir)
+        self.api_key = api_key
+
+    def daily(self, date: str) -> pd.DataFrame:
+        key = date.replace("-", "")
+        return load_or_fetch(cache_path(self.data_dir, "daily", date),
+                             lambda: parse_daily(_fetch(key, self.api_key)))
+```
+
+Run: `.venv/bin/pytest tests/jongga/test_krx_provider.py -v` → PASS (1 passed).
+
+- [ ] **Step 5: KRX 통합 스모크 (실호출 — 인증/필드는 프로브로 확정됨)**
+
+```bash
+.venv/bin/python - <<'PY'
+import yaml
+from pathlib import Path
+from jongga.data.krx_provider import KrxProvider
+key = yaml.safe_load(Path("secrets.yaml").read_text(encoding="utf-8"))["krx_api_key"]
+df = KrxProvider("data/krx", key).daily("2024-01-05")
+print("rows", len(df), "cols", list(df.columns))
+print(df[["close", "marketcap", "shares", "sect"]].head(3))
+PY
+```
+Expected: rows ≈ 1700, 컬럼 open/high/low/close/volume/value/marketcap/shares/sect(숫자형). (인증·필드는 `scripts/krx_probe.py`에서 이미 확정 — 이 스모크는 프로바이더 결선 확인용.)
+
+- [ ] **Step 6: pykrx 수급 (pykrx_supply.py) — 실호출 컬럼 확정**
+
+수급은 KRX OpenAPI 키에 없어 pykrx 사용(잔여 불확실성 = pykrx 컬럼명). 먼저 실호출로 컬럼 확인:
+```bash
+.venv/bin/python - <<'PY'
+from pykrx import stock
+sp = stock.get_market_net_purchases_of_equities("20240105", "20240105", "KOSDAQ", "기관합계")
+print(list(sp.columns)); print(sp.head(2).to_dict())
+PY
+```
+출력의 순매수 금액 컬럼명을 확인해 아래를 완성(기관·외국인 → inst_net/foreign_net), `normalize_supply`(Task 2) 연결:
+```python
+# jongga/data/pykrx_supply.py
+"""pykrx 투자자별 순매수(수급) 프로바이더. 컬럼명은 Step 6 실호출로 확정."""
+from __future__ import annotations
+from pathlib import Path
+import pandas as pd
+from jongga.data.cache import cache_path, load_or_fetch
+
+
+class PykrxSupply:
+    def __init__(self, data_dir, market: str = "KOSDAQ"):
         self.data_dir = Path(data_dir)
         self.market = market
 
-    def market_cap(self, date: str) -> pd.DataFrame:
+    def supply(self, date: str) -> pd.DataFrame:
         from pykrx import stock
         key = date.replace("-", "")
 
         def fetch():
-            df = stock.get_market_cap(key, market=self.market)
-            # 통합검증으로 컬럼명 확정: 한글('시가총액','상장주식수') → 정규화
-            return df.rename(columns={"시가총액": "marketcap", "상장주식수": "shares"})
+            inst = stock.get_market_net_purchases_of_equities(key, key, self.market, "기관합계")
+            foreign = stock.get_market_net_purchases_of_equities(key, key, self.market, "외국인")
+            col = "순매수거래대금"  # ← Step 6 출력으로 확정
+            out = pd.DataFrame({"inst_net": inst[col], "foreign_net": foreign[col]})
+            out.index.name = "ticker"
+            return out.fillna(0)
 
-        return load_or_fetch(cache_path(self.data_dir, "market_cap", date), fetch)
-
-    def tickers(self, date: str) -> list[str]:
-        from pykrx import stock
-        key = date.replace("-", "")
-        return stock.get_market_ticker_list(key, market=self.market)
+        return load_or_fetch(cache_path(self.data_dir, "supply", date), fetch)
 ```
 
-> ohlcv·supply 메서드는 Task 3 통합검증 후 동일 패턴으로 채운다(아래 Step 6에서 실제 컬럼 확정).
-
-- [ ] **Step 5: 캐시 단위테스트 통과 확인**
-
-Run: `.venv/bin/pytest tests/jongga/test_provider.py -v`
-Expected: PASS (2 passed)
-
-- [ ] **Step 6: 통합 검증 (pykrx 실호출 — 컬럼명·시그니처 확정)**
-
-Run:
-```bash
-.venv/bin/python - <<'PY'
-from pykrx import stock
-# 1) 시총·상장주식수 컬럼명
-mc = stock.get_market_cap("20260102", market="KOSDAQ")
-print("market_cap cols:", list(mc.columns)[:6])
-# 2) 일봉 전종목(특정일)
-oh = stock.get_market_ohlcv("20260102", market="KOSDAQ")
-print("ohlcv cols:", list(oh.columns))
-# 3) 투자자별 순매수(종목·기간)
-sp = stock.get_market_net_purchases_of_equities("20260102", "20260102", "KOSDAQ", "기관합계")
-print("supply head:", sp.head(2).to_dict())
-# 4) PIT 종목 목록(상폐 포함 여부 확인 — 과거일자)
-tk = stock.get_market_ticker_list("20200102", market="KOSDAQ")
-print("tickers 2020:", len(tk))
-PY
-```
-Expected: 각 컬럼명/형태 출력. **출력에 맞춰 `pykrx_provider.py`의 rename 매핑과 `ohlcv()/supply()` 구현을 확정**하고, `normalize_supply`(Task 2)에 실제 컬럼명을 연결. (네트워크 필요 — 실패 시 pykrx 버전/인터넷 확인.)
-
-- [ ] **Step 7: ohlcv()/supply() 구현 완성 + DF-2 골든 테스트**
-
-통합검증 결과로 `ohlcv()`·`supply()`를 완성하고, 수급 정규화가 실제 pykrx 출력에서 동작함을 고정하는 골든 테스트를 `tests/jongga/test_provider.py`에 추가(소량 실데이터 또는 저장한 fixture로). Commit:
+- [ ] **Step 7: Commit**
 
 ```bash
-git add jongga/data/provider.py jongga/data/pykrx_provider.py tests/jongga/test_provider.py && git commit -m "feat: pykrx data provider with parquet cache + supply golden test"
+git add jongga/data tests/jongga/test_cache.py tests/jongga/test_krx_provider.py && git commit -m "feat: KRX OpenAPI provider (price/cap/PIT) + pykrx supply"
 ```
 
 ---
@@ -697,7 +756,7 @@ git add jongga/factors/flow.py jongga/factors/value.py tests/jongga/test_flow_va
 
 ## Task 7: Universe 구성 — `universe.py`
 
-§5.1 t-1 유니버스: 거래대금 상위 K ∩ 시총하한 ∩ (PIT 상장종목). PIT 멤버십으로 생존편향 차단(BV-6). 순수 TDD + PIT 골든.
+§5.1 t-1 유니버스: (소속부 제외) → 거래대금 상위 K ∩ 시총하한. 모집단 = KRX 일별매매정보 그 시점 종목(상폐 포함 → PIT·생존편향 차단, 프로브 확정). 관리·환기·SPAC·외국기업은 `SECT_TP_NM`으로 제외. 순수 TDD.
 
 **Files:**
 - Create: `jongga/universe.py`
@@ -708,16 +767,18 @@ git add jongga/factors/flow.py jongga/factors/value.py tests/jongga/test_flow_va
 ```python
 # tests/jongga/test_universe.py
 import pandas as pd
-from jongga.universe import build_universe
+from jongga.universe import build_universe, EXCLUDE_SECT
 
 
-def test_universe_top_k_value_and_mincap_and_pit():
-    values = pd.Series({"A": 100, "B": 90, "C": 80, "D": 5})   # 거래대금
-    caps = pd.Series({"A": 1e11, "B": 1e9, "C": 1e11, "D": 1e11})  # B는 시총 미달
-    listed = {"A", "C", "D"}                                    # PIT: B는 상폐(미상장)
-    uni = build_universe(values, caps, listed, top_k=3, min_cap=5e10)
-    # 거래대금 상위3=A,B,C 중 B(시총미달)·(PIT 미상장)도 탈락 → A,C. D는 top3 밖.
-    assert uni == ["A", "C"]
+def test_universe_excludes_sect_then_topk_then_mincap():
+    daily = pd.DataFrame({
+        "value":     [100, 90, 80, 70, 5],
+        "marketcap": [1e11, 1e9, 1e11, 1e11, 1e11],
+        "sect":      ["우량기업부", "우량기업부", "관리종목(소속부없음)", "중견기업부", "중견기업부"],
+    }, index=["A", "B", "C", "D", "E"])
+    # 관리종목 C 제외 → 후보 A,B,D,E. 거래대금 상위3 = A,B,D. B 시총미달 → [A, D].
+    uni = build_universe(daily, top_k=3, min_cap=5e10, exclude_sect=EXCLUDE_SECT)
+    assert uni == ["A", "D"]
 ```
 
 - [ ] **Step 2: 테스트 실패 확인**
@@ -729,17 +790,20 @@ Expected: FAIL — `ModuleNotFoundError`
 
 ```python
 # jongga/universe.py
-"""t-1 유니버스 구성(거래대금 상위 K ∩ 시총하한 ∩ PIT 상장)."""
+"""t-1 유니버스: (소속부 제외) → 거래대금 상위 K → 시총하한.
+입력 daily = KRX 일별매매정보(index=ticker가 곧 PIT 멤버십, 상폐 포함)."""
 from __future__ import annotations
 import pandas as pd
 
+EXCLUDE_SECT = ("관리종목(소속부없음)", "투자주의환기종목(소속부없음)",
+                "SPAC(소속부없음)", "외국기업(소속부없음)")
 
-def build_universe(values: pd.Series, caps: pd.Series, listed: set[str],
-                   top_k: int, min_cap: float) -> list[str]:
-    ranked = values.sort_values(ascending=False).head(top_k)
-    out = [t for t in ranked.index
-           if t in listed and float(caps.get(t, 0)) >= min_cap]
-    return out
+
+def build_universe(daily: pd.DataFrame, top_k: int, min_cap: float,
+                   exclude_sect: tuple[str, ...]) -> list[str]:
+    eligible = daily[~daily["sect"].isin(exclude_sect)]
+    ranked = eligible.sort_values("value", ascending=False).head(top_k)
+    return [t for t in ranked.index if float(ranked.loc[t, "marketcap"]) >= min_cap]
 ```
 
 - [ ] **Step 4: 테스트 통과 확인**
@@ -747,19 +811,9 @@ def build_universe(values: pd.Series, caps: pd.Series, listed: set[str],
 Run: `.venv/bin/pytest tests/jongga/test_universe.py -v`
 Expected: PASS (1 passed)
 
-- [ ] **Step 5: PIT 골든 검증 (생존편향 — 통합)**
+- [ ] **Step 5: PIT/생존편향 — KRX로 확정됨 (재확인만)**
 
-Run:
-```bash
-.venv/bin/python - <<'PY'
-from pykrx import stock
-# 과거 특정일 상장종목에 '현재 상폐된 종목'이 포함되는지(=PIT 진짜) 확인
-old = set(stock.get_market_ticker_list("20190102", market="KOSDAQ"))
-now = set(stock.get_market_ticker_list("20260102", market="KOSDAQ"))
-print("2019 listed:", len(old), "| 2019-only(이후 상폐 추정):", len(old - now))
-PY
-```
-Expected: `2019-only` > 0 (과거일자에 그 시점 상장종목이 잡혀야 PIT·생존편향 차단 성립). **0이면 pykrx가 PIT를 안 주는 것 → 사전등록 BV-6 한계로 기록하고 대안(상폐목록 별도 수집) 검토.**
+`scripts/krx_probe.py`에서 이미 확정: KRX 일별매매정보 날짜별 응답 = 그 시점 종목집합(상폐 포함, 2019→2024 상폐 109). 즉 `KrxProvider.daily(d).index`가 곧 d 시점 PIT 멤버십이라 별도 ticker_list 불필요. (필요 시 두 날짜 `daily` index를 비교해 상폐 수>0 재확인.)
 
 - [ ] **Step 6: Commit**
 
@@ -771,7 +825,7 @@ git add jongga/universe.py tests/jongga/test_universe.py && git commit -m "feat:
 
 ## Task 8: 시황등급 — `regime.py`
 
-§6 시황배수. t-1 코스닥 거래대금 → 등급/배수. 순수 TDD.
+§6 시황배수. t-1 코스닥 시장 거래대금 → 등급/배수. (시장 거래대금 = KRX 일별매매정보 `ACC_TRDVAL` 합산, 또는 KOSDAQ 시리즈 일별시세 `ACC_TRDVAL`.) 순수 TDD.
 
 **Files:**
 - Create: `jongga/regime.py`
@@ -1414,7 +1468,8 @@ walk-forward: holdout_start 이전만 탐색/평가, 이후는 최종 1회.
 from __future__ import annotations
 import logging
 from jongga.config import Config
-from jongga.data.pykrx_provider import PykrxProvider
+from jongga.data.krx_provider import KrxProvider
+from jongga.data.pykrx_supply import PykrxSupply
 # ... (factors/universe/regime/selector/sizing/engine/gate import)
 
 logger = logging.getLogger(__name__)
@@ -1424,8 +1479,12 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config()
-    provider = PykrxProvider(cfg.data_dir, market=cfg.market)
-    # 1) 거래일·일봉·시총·수급 로드(provider, 캐시)
+    import yaml
+    from pathlib import Path
+    krx_key = yaml.safe_load(Path("secrets.yaml").read_text(encoding="utf-8"))["krx_api_key"]
+    prices = KrxProvider(cfg.data_dir, krx_key)        # 가격·시총·소속부·PIT
+    supply = PykrxSupply(cfg.data_dir, market=cfg.market)
+    # 1) 거래일·일봉(prices.daily)·수급(supply.supply) 로드(캐시)
     # 2) for d in trading_days: t-1 입력으로 팩터·universe·선정·사이징 → run_day
     # 3) 팩터별 일별 IC 수집 + net 수익률 시계열
     # 4) gate.ic / gate.drift / gate.report.verdict → 콘솔·파일 출력
