@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 # 패키지를 명시 선언 — 루트의 노트 폴더(mdfile 등)가 자동탐색을 깨뜨리지 않게
-packages = ["manju", "manju.kis", "manju.collector", "manju.replay"]
+packages = ["manju", "manju.kis", "manju.collector", "manju.replay",
+            "jongga", "jongga.data", "jongga.factors", "jongga.backtest", "jongga.gate"]
 
 [project]
 name = "manju"
@@ -15,6 +16,10 @@ dependencies = [
     "requests>=2.31",
     "pyarrow>=15.0",
     "pyyaml>=6.0",
+    "pykrx>=1.0.45",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
 ]
 
 [project.scripts]
