@@ -17,9 +17,11 @@ SELECTION_SCHEMA = {
             },
             "required": ["ticker", "catalyst_summary", "catalyst_timestamp",
                          "theme", "conviction", "rationale"],
+            "additionalProperties": False,
         }},
     },
     "required": ["regime_read", "picks"],
+    "additionalProperties": False,
 }
 
 SYSTEM_PROMPT = (
@@ -61,33 +63,15 @@ def select_with_gpt(candidates: list[dict], api_key: str, model: str = "gpt-5") 
             "format": {
                 "type": "json_schema",
                 "name": "selection",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "regime_read": {"type": "string"},
-                        "picks": {"type": "array", "items": {
-                            "type": "object",
-                            "properties": {
-                                "ticker": {"type": "string"},
-                                "catalyst_summary": {"type": "string"},
-                                "catalyst_timestamp": {"type": "string"},
-                                "theme": {"type": "string"},
-                                "conviction": {"type": "number"},
-                                "rationale": {"type": "string"},
-                            },
-                            "required": ["ticker", "catalyst_summary", "catalyst_timestamp",
-                                         "theme", "conviction", "rationale"],
-                            "additionalProperties": False,
-                        }},
-                    },
-                    "required": ["regime_read", "picks"],
-                    "additionalProperties": False,
-                },
+                "schema": SELECTION_SCHEMA,
                 "strict": True,
             }
         },
     )
-    return json.loads(resp.output_text)
+    try:
+        return json.loads(resp.output_text)
+    except Exception:
+        return {"regime_read": "parse_error", "picks": []}
 
 
 def parse_selection(raw: dict, candidate_tickers: set[str]) -> list[dict]:

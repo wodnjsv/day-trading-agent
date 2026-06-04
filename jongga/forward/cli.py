@@ -12,7 +12,6 @@ from jongga.config import Config
 from jongga.data.krx_provider import KrxProvider
 from jongga.data.pykrx_supply import PykrxSupply
 from jongga.forward.paperbook import PaperBook
-from jongga.forward.report import paired_by_day
 from jongga.forward.screen import entry_covariates
 from jongga.forward.select import select_with_gpt, parse_selection
 from jongga.forward.settle import settle_day
@@ -105,6 +104,12 @@ def eve(argv=None) -> None:
         }).dropna(subset=["value"])
         cand_tickers = build_universe(daily, SHORTLIST_N, cfg.universe.min_marketcap, EXCLUDE_SECT)
 
+        # 수급 패널 tm1 존재 여부 경고
+        if inst is None or foreign is None:
+            log.warning("%s: 수급 패널(inst/foreign) 없음 — tm1=%s 후보 전원 수급 탈락 예정", market, tm1)
+        elif tm1 not in inst.index or tm1 not in foreign.index:
+            log.warning("%s: 수급 패널에 tm1=%s 없음 — supply 데이터 누락 가능성", market, tm1)
+
         candidates: list[dict] = []
         for s in cand_tickers:
             if s not in close.columns:
@@ -154,8 +159,13 @@ def eve(argv=None) -> None:
             continue
 
         # LLM 선별
-        raw = select_with_gpt(candidates, secrets["openai_api_key"])
-        picks = parse_selection(raw, {c["ticker"] for c in candidates})
+        try:
+            raw = select_with_gpt(candidates, secrets["openai_api_key"])
+            picks = parse_selection(raw, {c["ticker"] for c in candidates})
+        except Exception as exc:
+            log.warning("%s: select_with_gpt 실패(%s) — LLM 픽 없이 baseline만 기록", market, exc)
+            picks = []
+            raw = {"regime_read": "error", "picks": []}
         k_t = len(picks)
         log.info("%s: LLM 픽 %d종목 %s", market, k_t,
                  [p["ticker"] for p in picks])
@@ -216,6 +226,7 @@ def eve(argv=None) -> None:
 
 
 def morn(argv=None) -> None:
+    """익일 정산. d+1 EOD 일봉(종가 확정)을 읽으므로 exit 당일(d+1) 장 마감 후 저녁에 실행."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger(__name__)
 
@@ -281,28 +292,41 @@ def morn(argv=None) -> None:
     log.info("morn 완료: 총 정산 %d건", total_settled)
 
 
-def report_cmd(argv=None) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-    if not DB.exists():
-        print("paperbook.db 없음")
-        return
-
+def report_cmd(argv=None):
+    import logging, statistics
+    from jongga.forward.paperbook import PaperBook
+    from jongga.forward.report import paired_pooled, paired_by_day, filter_pre_close, overlap_jaccard
+    logging.basicConfig(level=logging.INFO)
     pb = PaperBook(DB)
     rows = pb.all_settled()
-    if not rows:
-        print("정산된 행 없음")
-        return
-
-    for market in ("KOSPI", "KOSDAQ"):
-        mrows = [r for r in rows if r["market"] == market]
-        if not mrows:
-            continue
-        for band in ("net_s0", "net_s05", "net_s10"):
-            res = paired_by_day(mrows, band)
-            print(
-                f"[{market}][{band}] n_days={res['n_days']} "
-                f"mean_diff={res['mean_diff']:.4%} "
-                f"llm_mean={res['llm_mean']:.4%} "
-                f"p_rel={res['p_rel']:.3f}"
-            )
+    kept, excl = filter_pre_close(rows)            # ≤15:20 누수 필터
+    print(f"[누수필터] ≤15:20 catalyst만, 제외 LLM비율={excl:.1%}")
+    for band in ("net_s0", "net_s05", "net_s10"):
+        res = paired_pooled(kept, band)
+        tag = " *1차*" if band == "net_s05" else ""
+        print(f"[POOLED {band}{tag}] n_units={res['n_units']} mean_diff={res['mean_diff']:+.4%} p={res['p']:.3f}")
+    print("--- 보조(시장별, 탐색적) ---")
+    for mkt in ("KOSPI", "KOSDAQ"):
+        sub = [r for r in kept if r["market"] == mkt]
+        res = paired_by_day(sub, "net_s05")
+        print(f"[{mkt} net_s05] n_days={res['n_days']} mean_diff={res['mean_diff']:+.4%} "
+              f"llm_mean={res['llm_mean']:+.4%} p_rel={res['p_rel']:.3f}")
+    # 미시구조·겹침도(prereg §5)
+    llm = [r for r in kept if r["source"] == "llm"]
+    base = [r for r in kept if r["source"] == "baseline"]
+    def med(xs, k):
+        vals = [r[k] for r in xs if r.get(k) is not None]
+        return statistics.median(vals) if vals else float("nan")
+    # 일자별 Jaccard 평균
+    import pandas as pd
+    df = pd.DataFrame(kept)
+    jac = []
+    if not df.empty:
+        for (_d, _m), g in df.groupby(["run_date", "market"]):
+            lt = list(g[g["source"] == "llm"]["ticker"])
+            bt = list(g[g["source"] == "baseline"]["ticker"])
+            if lt or bt:
+                jac.append(overlap_jaccard(lt, bt))
+    print(f"[미시구조] LLM 거래대금中{med(llm,'trade_value')/1e8:.0f}억 vol20中{med(llm,'vol20'):.3f} | "
+          f"baseline 거래대금中{med(base,'trade_value')/1e8:.0f}억 vol20中{med(base,'vol20'):.3f} | "
+          f"평균 Jaccard={sum(jac)/len(jac) if jac else 0:.2f}")
