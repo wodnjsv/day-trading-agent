@@ -15,9 +15,10 @@ class PykrxSupply:
 
     def supply(self, date: str) -> pd.DataFrame:
         """투자자별 순매수(원). index=ticker, 컬럼: inst_net(기관합계)/foreign_net(외국인)."""
+        set_krx_login()                    # pykrx import 전에 KRX_ID/KRX_PW 설정 → import 시 로그인 성공
         from pykrx import stock
-        set_krx_login()                    # secrets의 krx_id/krx_pw → KRX_ID/KRX_PW (자동 로그인)
         key = date.replace("-", "")
+        kind = "supply" if self.market == "KOSDAQ" else f"supply_{self.market}"  # market별 캐시 분리
 
         def fetch():
             inst = stock.get_market_net_purchases_of_equities(key, key, self.market, "기관합계")
@@ -26,4 +27,4 @@ class PykrxSupply:
             out.index.name = "ticker"
             return out.fillna(0)
 
-        return load_or_fetch(cache_path(self.data_dir, "supply", date), fetch)
+        return load_or_fetch(cache_path(self.data_dir, kind, date), fetch)
