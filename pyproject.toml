@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 # 패키지를 명시 선언 — 루트의 노트 폴더(mdfile 등)가 자동탐색을 깨뜨리지 않게
 packages = ["manju", "manju.kis", "manju.collector", "manju.replay",
-            "jongga", "jongga.data", "jongga.factors", "jongga.backtest", "jongga.gate"]
+            "jongga", "jongga.data", "jongga.factors", "jongga.backtest", "jongga.gate",
+            "jongga.forward"]
 
 [project]
 name = "manju"
@@ -20,11 +21,15 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
     "scipy>=1.11",
+    "openai>=1.40",
 ]
 
 [project.scripts]
 manju-collect = "manju.collector.runner:main"
 manju-compact = "manju.collector.compact:main"
+jongga-forward-eve = "jongga.forward.cli:eve"
+jongga-forward-morn = "jongga.forward.cli:morn"
+jongga-forward-report = "jongga.forward.cli:report_cmd"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
