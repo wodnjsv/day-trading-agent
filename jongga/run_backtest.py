@@ -119,7 +119,7 @@ def collect_gate_inputs(dates, panels, cfg, weights, costs):
 def load_panels(provider, dates, supply_provider=None):
     """달력 후보일들에 대해 KRX daily(+선택적 수급)를 받아(캐시) [date×ticker] 패널로 적재.
     거래일이 아닌 날(빈 응답)은 건너뛴다. 반환: (실제 거래일 정렬 리스트, panels)."""
-    acc = {k: {} for k in ["close", "open", "value", "mcap", "sect", "vol"]}
+    acc = {k: {} for k in ["close", "open", "high", "low", "value", "mcap", "sect", "vol"]}
     sup = {"inst_net": {}, "foreign_net": {}}
     mktval = {}
     for dt in dates:
@@ -128,6 +128,8 @@ def load_panels(provider, dates, supply_provider=None):
             continue
         acc["close"][dt] = df["close"]
         acc["open"][dt] = df["open"]
+        acc["high"][dt] = df["high"]
+        acc["low"][dt] = df["low"]
         acc["value"][dt] = df["value"]
         acc["mcap"][dt] = df["marketcap"]
         acc["sect"][dt] = df["sect"]
@@ -140,6 +142,8 @@ def load_panels(provider, dates, supply_provider=None):
     panels = {
         "close": pd.DataFrame(acc["close"]).T.sort_index(),
         "open": pd.DataFrame(acc["open"]).T.sort_index(),
+        "high": pd.DataFrame(acc["high"]).T.sort_index(),
+        "low": pd.DataFrame(acc["low"]).T.sort_index(),
         "value": pd.DataFrame(acc["value"]).T.sort_index(),
         "mcap": pd.DataFrame(acc["mcap"]).T.sort_index(),
         "sect": pd.DataFrame(acc["sect"]).T.sort_index(),
